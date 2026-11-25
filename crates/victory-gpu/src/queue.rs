@@ -1258,6 +1258,15 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Called with the frame number after each frame the title presents (see [`on_frame`]).
+static ON_FRAME: std::sync::OnceLock<fn(u64)> = std::sync::OnceLock::new();
+
+/// Runs `callback` with the frame number after every frame the title presents, on the presenting thread. It
+/// must be quick and must not block. One callback per process; returns false if one is already set.
+pub fn on_frame(callback: fn(u64)) -> bool {
+    ON_FRAME.set(callback).is_ok()
+}
+
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -1406,6 +1415,9 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    if let Some(callback) = ON_FRAME.get() {
+        callback(frame);
+    }
     S_OK
 }
 /// The bytes from one plane's description to the next in a present.

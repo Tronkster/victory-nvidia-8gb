@@ -180,13 +180,41 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // A companion program (such as a multiplayer client) can connect while the title runs.
+    let _bridge = start_bridge(build, &hash)?;
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    victory_bridge::exit(code as i32);
     println!("title exited with {code}");
     Ok(())
+}
+
+/// Starts the bridge for a companion program when `VICTORY_BRIDGE_FILE` names
+/// the file to write its address and token to (crates/victory-bridge).
+#[cfg(windows)]
+fn start_bridge(
+    known: Option<&victory_game::KnownBuild>,
+    hash: &str,
+) -> Result<Option<victory_bridge::Bridge>> {
+    let Some(file) = std::env::var_os("VICTORY_BRIDGE_FILE").filter(|f| !f.is_empty()) else {
+        return Ok(None);
+    };
+    let info = victory_bridge::Info {
+        emulator_version: env!("CARGO_PKG_VERSION").to_owned(),
+        build: known.map(|b| b.label.to_owned()),
+        build_hash: hash.to_owned(),
+    };
+    let bridge = victory_bridge::Bridge::start(Path::new(&file), info)?;
+    victory_gpu::queue::on_frame(victory_bridge::frame);
+    println!(
+        "bridge         127.0.0.1:{} ({})",
+        bridge.address().port(),
+        Path::new(&file).display()
+    );
+    Ok(Some(bridge))
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and

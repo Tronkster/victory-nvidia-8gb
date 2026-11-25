@@ -512,6 +512,17 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+## Companion programs
+
+A program running beside the title (such as a multiplayer client) can connect
+to VIctory over a local bridge. Set `VICTORY_BRIDGE_FILE` to a file path;
+`victory run --execute` then listens on `127.0.0.1` and writes the port and a
+random token to that file. The companion connects, sends the token, and gets
+an event for every presented frame. Game operations (reading the player,
+spawning characters) are listed by `capabilities`; none exist yet, and each
+answers `unsupported` until it's built in `victory-game`. The protocol is
+described in `crates/victory-bridge/src/lib.rs`.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
