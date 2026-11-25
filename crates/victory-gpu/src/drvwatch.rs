@@ -23,6 +23,16 @@ use windows_sys::Win32::System::EventLog::{
     EVT_HANDLE, EVT_SUBSCRIBE_NOTIFY_ACTION, EvtSubscribe, EvtSubscribeActionDeliver, EvtSubscribeToFutureEvents,
 };
 
+/// The entries watched: those of the kernel drivers of the three vendors and
+/// of the system's own "display driver stopped responding" source, at the
+/// levels critical (1), error (2) and warning (3). Not information (4): the
+/// "Display" source also writes "Turn on Auto HDR" (event 4127) as a game
+/// starts, which tripped the switch 6 s into every run on a PC with an HDR
+/// display (2026-11-25) and cost the draw windows for nothing. Its "stopped
+/// responding and has recovered" (event 4101) is a warning.
+const QUERY: &str = "*[System[Provider[@Name='nvlddmkm' or @Name='amdkmdag' or @Name='amdwddmg' or @Name='igfx' \
+                     or @Name='igfxn' or @Name='Display'] and (Level=1 or Level=2 or Level=3)]]";
+
 /// Entries of a display driver seen since the start.
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Whether one was seen ([`tripped`]).
@@ -71,12 +81,7 @@ pub(crate) fn start() {
         }
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         let channel = wide("System");
-        // The kernel drivers of the three vendors, and the system's own
-        // "display driver stopped responding" source.
-        let query = wide(
-            "*[System[Provider[@Name='nvlddmkm' or @Name='amdkmdag' or @Name='amdwddmg' or @Name='igfx' or @Name='igfxn' \
-             or @Name='Display']]]",
-        );
+        let query = wide(QUERY);
         // SAFETY: valid strings for the call's length; the callback is a
         // plain function that touches only statics; the subscription is
         // kept for the life of the process.
@@ -172,11 +177,15 @@ mod tests {
     }
 
     /// The subscription itself: the system accepts the channel and the
-    /// query (a query it cannot read is refused at once).
+    /// query [`start`] makes (a query it cannot read is refused at once).
     #[test]
     fn the_system_takes_the_subscription() {
+        assert!(
+            QUERY.contains("Level=2") && !QUERY.contains("Level=4"),
+            "errors and warnings only"
+        );
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
-        let (channel, query) = (wide("System"), wide("*[System[Provider[@Name='nvlddmkm' or @Name='Display']]]"));
+        let (channel, query) = (wide("System"), wide(QUERY));
         // SAFETY: as in `start`.
         let subscription = unsafe {
             EvtSubscribe(0, std::ptr::null_mut(), channel.as_ptr(), query.as_ptr(), 0, std::ptr::null(), Some(on_event), EvtSubscribeToFutureEvents)
