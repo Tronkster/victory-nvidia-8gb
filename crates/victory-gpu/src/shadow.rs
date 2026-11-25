@@ -145,21 +145,70 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (by
+/// default a third of the card's budget, [`card_buffers_for`]).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    if let Some(&limits) = LIMITS.get() {
+        return limits;
+    }
+    let mb = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v << 20)
+    };
+    // From 1 MiB up by default (it was 16): the shader writes of the
+    // smaller buffers are then found by the card's hashes too, and with
+    // that the first room's walls were drawn in every run.
+    let least = mb("VICTORY_CARD_BUFFERS_MIN_MB")
+        .unwrap_or(1 << 20)
+        .max(1 << 20);
+    let most = match mb("VICTORY_CARD_BUFFERS_MB") {
+        Some(most) => most,
+        None => match crate::host::host().and_then(|h| h.video_memory()) {
+            Some([budget, ..]) => card_buffers_for(budget),
+            // Before the card's budget is known: the old fixed limit, not
+            // kept, so it is worked out again once there is a budget.
+            None => return (least, 1024 << 20),
+        },
+    };
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
-        // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        tracing::info!(
+            least_kb = least >> 10,
+            most_mb = most >> 20,
+            "copies of title buffers in the card's memory: the smallest and the most (VICTORY_CARD_BUFFERS_MIN_MB, _MB)"
+        );
+        (least, most)
     })
+}
+
+/// The default most bytes of card copies of title buffers for a card whose
+/// budget is `budget` bytes: a third of it, from 1,024 MB (the fixed default
+/// before, still there on small cards) to 4,096 MB. On an 8 GB card (a
+/// budget of 7,249 MB) that is 2,416 MB: with the limit at 1,024 MB the card
+/// held 4.9 GB while 2.3 GB of its budget went unused and shaders read the
+/// title buffers that did not fit over the bus; at 2,560 MB the card's time
+/// a frame fell by 17 % (RTX 3070 Ti, 2026-11-25).
+fn card_buffers_for(budget: u64) -> u64 {
+    (budget / 3).clamp(1024 << 20, 4096 << 20)
+}
+
+#[cfg(test)]
+mod card_buffer_tests {
+    #[test]
+    fn the_card_buffer_limit_is_a_third_of_the_budget_within_bounds() {
+        const MB: u64 = 1 << 20;
+        assert_eq!(super::card_buffers_for(7249 * MB) / MB, 2416);
+        assert_eq!(
+            super::card_buffers_for(3000 * MB),
+            1024 * MB,
+            "small cards keep the old limit"
+        );
+        assert_eq!(super::card_buffers_for(22000 * MB), 4096 * MB);
+    }
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.

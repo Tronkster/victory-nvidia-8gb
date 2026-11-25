@@ -1456,7 +1456,29 @@ pub(crate) fn room() -> bool {
             // What is free in the heaps of plain textures is room, though
             // the system counts it as in use.
             let used = used.saturating_sub(HEAP_FREE.load(Relaxed));
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            let [buffers_kept, targets_kept] =
+                [crate::shadow::card_room_kept(), targets_room_kept()];
+            let room = used + buffers_kept + targets_kept < budget / 100 * room_percent();
+            // Every ten seconds, what the rule weighed (MB).
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now = crate::host::now_ms();
+            if now.saturating_sub(LOGGED.load(Relaxed)) >= 10_000 {
+                LOGGED.store(now, Relaxed);
+                tracing::info!(
+                    budget = budget >> 20,
+                    used = used >> 20,
+                    targets = HOST_TEXTURES[1]
+                        .load(Relaxed)
+                        .saturating_sub(KINDS[1].load(Relaxed))
+                        >> 20,
+                    texture_copies = filled >> 20,
+                    kept_for_buffers = buffers_kept >> 20,
+                    kept_for_targets = targets_kept >> 20,
+                    room,
+                    "the card's room for texture copies"
+                );
+            }
+            room
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1464,8 +1486,9 @@ pub(crate) fn room() -> bool {
 
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (by default 3,072 at
+/// 3840x2160 and less below it, [`targets_room_for`]; 0: none, as before)
+/// less what such copies hold now.
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1484,14 +1507,48 @@ pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+        let most = std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or_else(
+                || targets_room_for(render_pixels()),
+                |mb| mb.min(8192) << 20,
+            );
+        tracing::info!(
+            mb = most >> 20,
+            "room kept on the card for render targets (VICTORY_CARD_ROOM_FOR_TARGETS_MB)"
+        );
+        most
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
+}
+
+/// The pixels the title renders at most: `VICTORY_RESOLUTION` (its ladder
+/// capped there), else the 3840x2160 display it is told it has.
+#[cfg(windows)]
+fn render_pixels() -> u64 {
+    std::env::var("VICTORY_RESOLUTION")
+        .ok()
+        .and_then(|text| {
+            let (w, h) = text.trim().split_once(['x', 'X'])?;
+            Some(w.trim().parse::<u64>().ok()? * h.trim().parse::<u64>().ok()?)
+        })
+        .filter(|&p| p > 0)
+        .unwrap_or(3840 * 2160)
+}
+
+/// The default room for render targets at `pixels`: 832 MB that does not
+/// follow the frame's size (shadow maps and other fixed-size targets) and
+/// 2,240 MB more at 3840x2160, in proportion to the pixels. That is the
+/// 3,072 MB measured at 3840x2160 (runs 193-198, above) and 1,392 MB at
+/// 1920x1080, where the targets measured 1,007 to 1,389 MB (RTX 3070 Ti,
+/// 2026-11-25). Keeping 4K's room at 1080p held 1.7 to 2 GB of an 8 GB
+/// card back from texture copies all through the world.
+#[cfg(windows)]
+fn targets_room_for(pixels: u64) -> u64 {
+    (832u64 << 20) + (2240u64 << 20) * pixels / (3840 * 2160)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -3223,6 +3280,18 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn the_room_for_render_targets_follows_the_frame_size() {
+        const MB: u64 = 1 << 20;
+        assert_eq!(targets_room_for(3840 * 2160), 3072 * MB);
+        assert_eq!(targets_room_for(1920 * 1080), 1392 * MB);
+        // Above what 1080p's targets measured (1,389 MB), between the two.
+        let qhd = targets_room_for(2560 * 1440);
+        assert!(qhd > 1392 * MB && qhd < 3072 * MB);
+        assert!(targets_room_for(1280 * 720) >= 832 * MB);
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;

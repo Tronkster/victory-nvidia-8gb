@@ -17,8 +17,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
-    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_FREE,
+    MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
@@ -49,6 +49,76 @@ pub(crate) fn on_wine() -> bool {
 
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
+
+/// The title's own reservations (`XMemVirtualAlloc` at an address of our
+/// choice), base to length: what [`title_used`] walks for committed pages.
+/// Released ones are dropped there (their frees go straight to the host).
+static TITLE_REGIONS: Mutex<std::collections::BTreeMap<usize, usize>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Bytes of live [`XMemAllocDefault`] blocks from the host heap.
+static DEFAULT_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// What the title uses, as a console counts it: its physical pages, the
+/// committed private pages of its own reservations (mapped views are its
+/// physical pages, counted once), and its live heap blocks. Not the
+/// emulator's memory, nor the card's copies of title memory.
+fn title_used() -> usize {
+    let physical = physical().pages.len() * PAGE;
+    let mut committed = 0;
+    let mut regions = TITLE_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    regions.retain(|&base, &mut len| match region_committed(base, len) {
+        Some(bytes) => {
+            committed += bytes;
+            true
+        }
+        None => false,
+    });
+    physical + committed + DEFAULT_LIVE.load(Ordering::Relaxed)
+}
+
+/// The committed private bytes of the reservation at `base`, `len` long;
+/// `None` once it is released (or the address is someone else's now).
+fn region_committed(base: usize, len: usize) -> Option<usize> {
+    let end = base.saturating_add(len);
+    let mut committed = 0;
+    let mut at = base;
+    while at < end {
+        // SAFETY: a query of our own address space into a local.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let got = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                at as *const c_void,
+                &mut info,
+                size_of_val(&info),
+            )
+        };
+        if got == 0 {
+            break;
+        }
+        if at == base && (info.State == MEM_FREE || info.AllocationBase as usize != base) {
+            return None;
+        }
+        let next = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .max(at + 1);
+        if info.State == MEM_COMMIT && info.Type == MEM_PRIVATE {
+            committed += next.min(end) - at;
+        }
+        at = next;
+    }
+    Some(committed)
+}
+
+/// `VICTORY_XMEM_USED=process`: tell the title the whole process's commit
+/// as its use, as before (the emulator's own memory and the card's copies
+/// then count against the title's limit).
+fn used_is_process() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("VICTORY_XMEM_USED").is_ok_and(|v| v.trim() == "process"));
+    *ON
+}
 
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
@@ -153,6 +223,12 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if base.is_null() && !at.is_null() {
+        TITLE_REGIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -298,6 +374,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     if block.is_null() {
         return block.cast();
     }
+    DEFAULT_LIVE.fetch_add(layout.size(), Ordering::Relaxed);
     // SAFETY: the block holds the alignment (at least the header) and then
     // `size` bytes.
     unsafe {
@@ -323,6 +400,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        DEFAULT_LIVE.fetch_sub(size, Ordering::Relaxed);
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -989,7 +1067,7 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
-/// The title's budget and our process's commit as what it uses. No tools
+/// The title's budget and what it uses of it ([`title_used`]). No tools
 /// memory: a retail console.
 // shortcut: all fields are filled whatever the flags ask for, and use is
 // not split by bandwidth class (GPU-optimal use reads 0); track
@@ -998,27 +1076,40 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     if out.is_null() {
         return 0;
     }
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
+    let used = if used_is_process() {
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+        counters.PagefileUsage
+    } else {
+        // The walk over the title's reservations, at most four times a second.
+        static LAST: Mutex<Option<(std::time::Instant, usize)>> = Mutex::new(None);
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            Some((when, used)) if when.elapsed() < std::time::Duration::from_millis(250) => used,
+            _ => {
+                let used = title_used();
+                *last = Some((std::time::Instant::now(), used));
+                used
+            }
+        }
     };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used: used,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
     // What the title is told, logged at the first asking and at every
-    // 1,024th: "used" is all the process has committed, the layer's own
-    // memory and the card's included (27 GB in run 60's gameplay against a
-    // limit of 13.5 GB). A title that budgets its streaming from these two
-    // figures believes it is far over its limit.
-    // shortcut: the figure is not yet the title's own memory alone (its
-    // heaps and the pages it mapped); count those if this line shows the
-    // title asking.
+    // 1,024th. "Used" is the title's own memory ([`title_used`]); it was the
+    // whole process's commit, the layer's own memory and the card's copies
+    // included (27 GB in run 60's gameplay against a limit of 13.5 GB),
+    // which a title budgeting its streaming from these figures reads as far
+    // over its limit. `VICTORY_XMEM_USED=process` gives the old figure.
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
     if asked.is_multiple_of(1024) {
@@ -1154,6 +1245,77 @@ mod tests {
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn the_title_is_told_its_own_memory_not_the_process_commit() {
+        // Other tests allocate at the same time, so the totals move; each
+        // part is checked on its own.
+        let regions = || {
+            TITLE_REGIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        };
+        let size = 64 * MIB;
+        let flags = MEM_RESERVE | MEM_COMMIT;
+        let p =
+            XMemVirtualAlloc(std::ptr::null_mut(), size, flags, GRAPHICS, PAGE_READWRITE) as usize;
+        assert_ne!(p, 0);
+        assert_eq!(
+            regions().get(&p),
+            Some(&size),
+            "the title's reservation is known"
+        );
+        assert_eq!(
+            region_committed(p, size),
+            Some(size),
+            "and its committed pages counted"
+        );
+        // Half reserved only: only the committed half counts.
+        let r = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            size,
+            MEM_RESERVE,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        // SAFETY: committing part of our own reservation.
+        assert!(!unsafe { VirtualAlloc(r, size / 2, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        assert_eq!(region_committed(r as usize, size), Some(size / 2));
+        // Memory the emulator commits for itself is not the title's.
+        // SAFETY: a plain reservation of our own, released below.
+        let own = unsafe { VirtualAlloc(std::ptr::null(), size, flags, PAGE_READWRITE) };
+        assert!(!own.is_null() && !regions().contains_key(&(own as usize)));
+        // SAFETY: all three are ours, released whole.
+        unsafe {
+            assert_ne!(VirtualFree(own, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(p as *mut c_void, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(r, 0, MEM_RELEASE), 0);
+        }
+        // Released: not counted any more (a test running alongside may have
+        // reserved at the same address since; then it is that one's count).
+        assert_ne!(
+            region_committed(p, size),
+            Some(size),
+            "a released reservation"
+        );
+        title_used();
+        // Dropped, unless a test running alongside reserved there since.
+        if let Some(&len) = regions().get(&p) {
+            assert!(
+                region_committed(p, len).is_some(),
+                "only live reservations stay"
+            );
+        }
+    }
+
+    #[test]
+    fn heap_blocks_count_while_they_live() {
+        let block = XMemAllocDefault(3 * MIB, 0);
+        assert!(!block.is_null());
+        assert!(DEFAULT_LIVE.load(Ordering::Relaxed) >= 3 * MIB);
+        XMemFreeDefault(block, 0);
     }
 
     #[test]

@@ -640,7 +640,28 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // The card, not whatever Windows lists first: on a desktop whose
+            // processor has graphics of its own (a Ryzen 7000), that can be
+            // the processor's.
+            let mut on = None;
+            for choice in host_adapters() {
+                if D3D12CreateDevice(&choice.adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok() {
+                    on = Some(choice);
+                    break;
+                }
+                tracing::warn!(adapter = %choice.name, "no D3D12 device on this adapter; trying the next");
+            }
+            match on {
+                Some(choice) => tracing::info!(
+                    adapter = %choice.name,
+                    dedicated_mb = choice.dedicated >> 20,
+                    "host device on this adapter (VICTORY_ADAPTER picks another)"
+                ),
+                None => {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                    tracing::info!("host device on the default adapter");
+                }
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -790,6 +811,89 @@ mod caption_tests {
     }
 }
 
+/// A hardware adapter the host device can be made on.
+pub(crate) struct AdapterChoice {
+    pub(crate) adapter: IDXGIAdapter1,
+    pub(crate) name: String,
+    /// Its own video memory, in bytes.
+    pub(crate) dedicated: usize,
+}
+
+/// The hardware adapters to try for the host device, best first: Windows'
+/// high-performance order (a graphics card before the processor's own
+/// graphics), software adapters left out. `VICTORY_ADAPTER` narrows it to one:
+/// an index into that order, or part of the adapter's name (case ignored).
+pub(crate) fn host_adapters() -> Vec<AdapterChoice> {
+    let mut all = Vec::new();
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return all;
+        };
+        for i in 0.. {
+            let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                i,
+                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            ) else {
+                break;
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let len = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..len]);
+            all.push(AdapterChoice {
+                adapter,
+                name,
+                dedicated: desc.DedicatedVideoMemory,
+            });
+        }
+    }
+    pick_adapter(all, std::env::var("VICTORY_ADAPTER").ok().as_deref())
+}
+
+/// `wanted` (an index, or part of a name) out of `all`; all of them, in order,
+/// when nothing is wanted or nothing matches.
+fn pick_adapter<T: AdapterName>(all: Vec<T>, wanted: Option<&str>) -> Vec<T> {
+    let Some(wanted) = wanted.map(str::trim).filter(|w| !w.is_empty()) else {
+        return all;
+    };
+    let index = wanted.parse::<usize>().ok();
+    let needle = wanted.to_lowercase();
+    let hit = all.iter().enumerate().position(|(i, a)| {
+        index == Some(i) || (index.is_none() && a.adapter_name().to_lowercase().contains(&needle))
+    });
+    match hit {
+        Some(i) => all.into_iter().nth(i).into_iter().collect(),
+        None => {
+            let names: Vec<_> = all.iter().map(AdapterName::adapter_name).collect();
+            tracing::warn!(
+                wanted,
+                ?names,
+                "VICTORY_ADAPTER matches no hardware adapter; using the usual order"
+            );
+            all
+        }
+    }
+}
+
+trait AdapterName {
+    fn adapter_name(&self) -> &str;
+}
+
+impl AdapterName for AdapterChoice {
+    fn adapter_name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -850,6 +954,33 @@ mod tests {
     }
 
     use super::*;
+
+    impl AdapterName for &'static str {
+        fn adapter_name(&self) -> &str {
+            self
+        }
+    }
+
+    #[test]
+    fn victory_adapter_picks_by_index_or_name_and_falls_back_to_the_order() {
+        let all = || vec!["NVIDIA GeForce RTX 3070 Ti", "AMD Radeon(TM) Graphics"];
+        assert_eq!(pick_adapter(all(), None), all());
+        assert_eq!(pick_adapter(all(), Some(" ")), all());
+        assert_eq!(
+            pick_adapter(all(), Some("1")),
+            vec!["AMD Radeon(TM) Graphics"]
+        );
+        assert_eq!(
+            pick_adapter(all(), Some("radeon")),
+            vec!["AMD Radeon(TM) Graphics"]
+        );
+        assert_eq!(
+            pick_adapter(all(), Some("RTX")),
+            vec!["NVIDIA GeForce RTX 3070 Ti"]
+        );
+        assert_eq!(pick_adapter(all(), Some("intel")), all());
+        assert_eq!(pick_adapter(all(), Some("7")), all());
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
